@@ -495,6 +495,7 @@ err_free_decomp_bitmap:
 	bitmap_free(ctx->qp_ctx[HZIP_QPC_DECOMP].req_q.req_bitmap);
 err_free_comp_q:
 	kfree(ctx->qp_ctx[HZIP_QPC_COMP].req_q.q);
+	bitmap_free(ctx->qp_ctx[HZIP_QPC_COMP].req_q.req_bitmap);
 err_free_comp_bitmap:
 	bitmap_free(ctx->qp_ctx[HZIP_QPC_COMP].req_q.req_bitmap);
 	return ret;
