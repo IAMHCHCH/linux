@@ -630,6 +630,14 @@ void zstd_register_sequence_producer(
 );
 
 /**
+ * ZSTD_SEQUENCE_PRODUCER_ERROR - error return value for sequence producer
+ *
+ * Return this value from the sequence producer callback to signal zstd
+ * to fall back to its internal sequence producer.
+ */
+#define ZSTD_SEQUENCE_PRODUCER_ERROR ((size_t)(-1))
+
+/**
  * struct zstd_frame_params - zstd frame parameters stored in the frame header
  * @frameContentSize: The frame content size, or ZSTD_CONTENTSIZE_UNKNOWN if not
  *                    present.
