@@ -63,6 +63,7 @@ struct hisi_zip_req_q {
 	unsigned long *req_bitmap;
 	spinlock_t req_lock;
 	u16 size;
+	u16 next_req_id;  /* Hint for next allocation to reduce search time */
 };
 
 struct hisi_zip_qp_ctx {
@@ -141,17 +142,27 @@ static struct hisi_zip_req *hisi_zip_create_req(struct hisi_zip_qp_ctx *qp_ctx,
 	struct hisi_zip_req_q *req_q = &qp_ctx->req_q;
 	struct hisi_zip_req *q = req_q->q;
 	struct hisi_zip_req *req_cache;
-	int req_id;
+	u16 req_id, hint;
 
 	spin_lock(&req_q->req_lock);
 
-	req_id = find_first_zero_bit(req_q->req_bitmap, req_q->size);
+	/* Use round-robin hint to reduce search time and improve locality */
+	hint = req_q->next_req_id;
+	req_id = find_next_zero_bit(req_q->req_bitmap, req_q->size, hint);
+
+	/* Wrap around if no free slot found from hint position */
+	if (req_id >= req_q->size)
+		req_id = find_first_zero_bit(req_q->req_bitmap, req_q->size);
+
 	if (req_id >= req_q->size) {
 		spin_unlock(&req_q->req_lock);
 		dev_dbg(&qp_ctx->qp->qm->pdev->dev, "req cache is full!\n");
 		return ERR_PTR(-EAGAIN);
 	}
 	set_bit(req_id, req_q->req_bitmap);
+
+	/* Update hint for next allocation (round-robin) */
+	req_q->next_req_id = (req_id + 1) % req_q->size;
 
 	spin_unlock(&req_q->req_lock);
 
