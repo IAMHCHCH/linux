@@ -344,16 +344,18 @@ static void hisi_zip_acomp_cb(struct hisi_qp *qp, void *data)
 	hisi_zip_remove_req(qp_ctx, req);
 }
 
-static int hisi_zip_acompress(struct acomp_req *acomp_req)
+static int hisi_zip_do_comp_work(struct acomp_req *acomp_req,
+				 enum hisi_zip_alg_type qpc_type,
+				 bool is_decompress)
 {
 	struct hisi_zip_ctx *ctx = crypto_tfm_ctx(acomp_req->base.tfm);
-	struct hisi_zip_qp_ctx *qp_ctx = &ctx->qp_ctx[HZIP_QPC_COMP];
+	struct hisi_zip_qp_ctx *qp_ctx = &ctx->qp_ctx[qpc_type];
 	struct hisi_zip_req *req;
 	struct device *dev;
 	int ret;
 
 	if (ctx->fallback)
-		return hisi_zip_fallback_do_work(acomp_req, 0);
+		return hisi_zip_fallback_do_work(acomp_req, is_decompress);
 
 	dev = &qp_ctx->qp->qm->pdev->dev;
 
@@ -363,43 +365,27 @@ static int hisi_zip_acompress(struct acomp_req *acomp_req)
 
 	ret = hisi_zip_do_work(qp_ctx, req);
 	if (unlikely(ret != -EINPROGRESS)) {
-		dev_info_ratelimited(dev, "failed to do compress (%d)!\n", ret);
+		dev_info_ratelimited(dev, "failed to do %scompress (%d)!\n",
+				     is_decompress ? "de" : "", ret);
 		hisi_zip_remove_req(qp_ctx, req);
 	}
 
 	return ret;
+}
+
+static int hisi_zip_acompress(struct acomp_req *acomp_req)
+{
+	return hisi_zip_do_comp_work(acomp_req, HZIP_QPC_COMP, false);
 }
 
 static int hisi_zip_adecompress(struct acomp_req *acomp_req)
 {
-	struct hisi_zip_ctx *ctx = crypto_tfm_ctx(acomp_req->base.tfm);
-	struct hisi_zip_qp_ctx *qp_ctx = &ctx->qp_ctx[HZIP_QPC_DECOMP];
-	struct hisi_zip_req *req;
-	struct device *dev;
-	int ret;
-
-	if (ctx->fallback)
-		return hisi_zip_fallback_do_work(acomp_req, 1);
-
-	dev = &qp_ctx->qp->qm->pdev->dev;
-
-	req = hisi_zip_create_req(qp_ctx, acomp_req);
-	if (IS_ERR(req))
-		return PTR_ERR(req);
-
-	ret = hisi_zip_do_work(qp_ctx, req);
-	if (unlikely(ret != -EINPROGRESS)) {
-		dev_info_ratelimited(dev, "failed to do decompress (%d)!\n",
-				     ret);
-		hisi_zip_remove_req(qp_ctx, req);
-	}
-
-	return ret;
+	return hisi_zip_do_comp_work(acomp_req, HZIP_QPC_DECOMP, true);
 }
 
 static int hisi_zip_decompress(struct acomp_req *acomp_req)
 {
-	return hisi_zip_fallback_do_work(acomp_req, 1);
+	return hisi_zip_fallback_do_work(acomp_req, true);
 }
 
 static const struct hisi_zip_sqe_ops hisi_zip_ops = {
