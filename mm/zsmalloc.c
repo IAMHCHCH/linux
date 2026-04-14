@@ -825,6 +825,7 @@ static void __free_zspage(struct zs_pool *pool, struct size_class *class,
 	cache_free_zspage(zspage);
 
 	class_stat_sub(class, ZS_OBJS_ALLOCATED, class->objs_per_zspage);
+	atomic_long_sub(class->objs_per_zspage, &pool->stats.objs_allocated);
 	atomic_long_sub(class->pages_per_zspage, &pool->pages_allocated);
 }
 
@@ -1324,6 +1325,7 @@ unsigned long zs_malloc(struct zs_pool *pool, size_t size, gfp_t gfp,
 		/* Now move the zspage to another fullness group, if required */
 		fix_fullness_group(class, zspage);
 		class_stat_add(class, ZS_OBJS_INUSE, 1);
+		atomic_long_inc(&pool->stats.objs_inuse);
 
 		goto out;
 	}
@@ -1343,6 +1345,8 @@ unsigned long zs_malloc(struct zs_pool *pool, size_t size, gfp_t gfp,
 	atomic_long_add(class->pages_per_zspage, &pool->pages_allocated);
 	class_stat_add(class, ZS_OBJS_ALLOCATED, class->objs_per_zspage);
 	class_stat_add(class, ZS_OBJS_INUSE, 1);
+	atomic_long_add(class->objs_per_zspage, &pool->stats.objs_allocated);
+	atomic_long_inc(&pool->stats.objs_inuse);
 
 	/* We completely set up zspage so mark them as movable */
 	SetZsPageMovable(pool, zspage);
@@ -1405,6 +1409,7 @@ void zs_free(struct zs_pool *pool, unsigned long handle)
 	read_unlock(&pool->lock);
 
 	class_stat_sub(class, ZS_OBJS_INUSE, 1);
+	atomic_long_dec(&pool->stats.objs_inuse);
 	obj_free(class->size, obj);
 
 	fullness = fix_fullness_group(class, zspage);

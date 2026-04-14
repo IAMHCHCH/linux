@@ -19,6 +19,13 @@
 struct zs_pool_stats {
 	/* How many pages were migrated (freed) */
 	atomic_long_t pages_compacted;
+	/*
+	 * Total object slots allocated across all zspages in the pool.
+	 * This includes both in-use and free slots (internal fragmentation).
+	 */
+	atomic_long_t objs_allocated;
+	/* Object slots currently in use */
+	atomic_long_t objs_inuse;
 };
 
 struct zs_pool;
