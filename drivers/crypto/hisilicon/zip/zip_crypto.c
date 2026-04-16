@@ -5,6 +5,8 @@
 #include <linux/bitmap.h>
 #include <linux/dma-mapping.h>
 #include <linux/scatterlist.h>
+#include <linux/zstd.h>
+#include <linux/vmalloc.h>
 #include "zip.h"
 
 /* hisi_zip_sqe dw3 */
@@ -18,6 +20,7 @@
 #define HZIP_REQ_TYPE_M				GENMASK(7, 0)
 #define HZIP_ALG_TYPE_DEFLATE			0x01
 #define HZIP_ALG_TYPE_LZ4			0x04
+#define HZIP_ALG_TYPE_LZ77_ZSTD		0x03
 #define HZIP_BUF_TYPE_M				GENMASK(11, 8)
 #define HZIP_SGL				0x1
 #define HZIP_WIN_SIZE_M				GENMASK(15, 12)
@@ -28,9 +31,14 @@
 
 #define HZIP_ALG_DEFLATE			GENMASK(5, 4)
 #define HZIP_ALG_LZ4				BIT(8)
+#define HZIP_ALG_ZSTD				GENMASK(7, 6)	/* LZ77 for zstd */
 
 static DEFINE_MUTEX(zip_algs_lock);
 static unsigned int zip_available_devs;
+
+/* Forward declarations for zstd */
+static int hisi_zip_register_zstd(struct hisi_qm *qm);
+static void hisi_zip_unregister_zstd(struct hisi_qm *qm);
 
 enum hisi_zip_alg_type {
 	HZIP_ALG_TYPE_COMP = 0,
@@ -46,7 +54,8 @@ enum {
 #define GET_REQ_FROM_SQE(sqe)	((u64)(sqe)->dw26 | (u64)(sqe)->dw27 << 32)
 #define COMP_NAME_TO_TYPE(alg_name)					\
 	(!strcmp((alg_name), "deflate") ? HZIP_ALG_TYPE_DEFLATE :	\
-	(!strcmp((alg_name), "lz4") ? HZIP_ALG_TYPE_LZ4 : 0))
+	(!strcmp((alg_name), "lz4") ? HZIP_ALG_TYPE_LZ4 :		\
+	(!strcmp((alg_name), "zstd") ? HZIP_ALG_TYPE_LZ77_ZSTD : 0)))
 
 struct hisi_zip_req {
 	struct acomp_req *req;
@@ -701,11 +710,17 @@ int hisi_zip_register_to_crypto(struct hisi_qm *qm)
 	if (ret)
 		goto unreg_deflate;
 
+	ret = hisi_zip_register_zstd(qm);
+	if (ret)
+		goto unreg_lz4;
+
 	zip_available_devs++;
 	mutex_unlock(&zip_algs_lock);
 
 	return 0;
 
+unreg_lz4:
+	hisi_zip_unregister_lz4(qm);
 unreg_deflate:
 	hisi_zip_unregister_deflate(qm);
 unlock:
@@ -721,7 +736,219 @@ void hisi_zip_unregister_from_crypto(struct hisi_qm *qm)
 
 	hisi_zip_unregister_deflate(qm);
 	hisi_zip_unregister_lz4(qm);
+	hisi_zip_unregister_zstd(qm);
 
 unlock:
 	mutex_unlock(&zip_algs_lock);
+}
+
+/* ==================== zstd algorithm with sequence producer ==================== */
+
+#define ZSTD_DEF_LEVEL		3
+#define ZSTD_MAX_WINDOWLOG	17
+#define ZSTD_MAX_SIZE		BIT(ZSTD_MAX_WINDOWLOG)
+
+struct hisi_zip_zstd_ctx {
+	zstd_cctx *cctx;
+	zstd_dctx *dctx;
+	void *wksp;
+	size_t wksp_size;
+	zstd_parameters params;
+};
+
+static DEFINE_MUTEX(zstd_stream_lock);
+static struct crypto_acomp_streams zstd_streams;
+
+static size_t zstd_sequence_bound(size_t src_size)
+{
+	/* Each sequence encodes at most 3 bytes of data (min match is 3) */
+	return (src_size / 3) + 2;
+}
+
+static void *hisi_zip_zstd_alloc_stream(void)
+{
+	zstd_parameters params;
+	struct hisi_zip_zstd_ctx *ctx;
+	size_t wksp_size, cctx_wksp_size, dctx_wksp_size;
+
+	params = zstd_get_params(ZSTD_DEF_LEVEL, ZSTD_MAX_SIZE);
+
+	cctx_wksp_size = zstd_cctx_workspace_bound_with_ext_seq_prod(&params.cParams);
+	dctx_wksp_size = zstd_dstream_workspace_bound(ZSTD_MAX_SIZE);
+	wksp_size = max(cctx_wksp_size, dctx_wksp_size);
+	if (!wksp_size)
+		return ERR_PTR(-EINVAL);
+
+	ctx = kvmalloc(sizeof(*ctx) + wksp_size, GFP_KERNEL);
+	if (!ctx)
+		return ERR_PTR(-ENOMEM);
+
+	ctx->params = params;
+	ctx->wksp_size = wksp_size;
+	ctx->wksp = ctx + 1;
+
+	return ctx;
+}
+
+static void hisi_zip_zstd_free_stream(void *ctx)
+{
+	kvfree(ctx);
+}
+
+static int hisi_zip_zstd_init(struct crypto_acomp *acomp_tfm)
+{
+	int ret;
+
+	mutex_lock(&zstd_stream_lock);
+	zstd_streams.alloc_ctx = hisi_zip_zstd_alloc_stream;
+	zstd_streams.free_ctx = hisi_zip_zstd_free_stream;
+	ret = crypto_acomp_alloc_streams(&zstd_streams);
+	mutex_unlock(&zstd_stream_lock);
+
+	return ret;
+}
+
+/*
+ * hisi_zip_zstd_seq_producer - sequence producer callback for zstd
+ *
+ * This callback is invoked by zstd during compression to generate
+ * match sequences. We use the HiSilicon ZIP hardware to perform
+ * LZ77 matching and convert the results to zstd sequences.
+ *
+ * Note: Currently this is a placeholder that falls back to software
+ * matching. Hardware-accelerated LZ77 matching would require:
+ * 1. Synchronous hardware polling in this callback, or
+ * 2. Pre-computed sequences from async hardware operation
+ */
+static size_t hisi_zip_zstd_seq_producer(
+	void *sequence_producer_state,
+	zstd_sequence *out_seqs, size_t out_seqs_capacity,
+	const void *src, size_t src_size,
+	const void *dict, size_t dict_size,
+	int compression_level,
+	size_t window_size)
+{
+	/*
+	 * Return error to signal zstd to use its internal sequence producer.
+	 * Hardware-accelerated LZ77 can be implemented here when hardware
+	 * supports synchronous operation or when using pre-computed sequences.
+	 */
+	return ZSTD_SEQUENCE_PRODUCER_ERROR;
+}
+
+static int hisi_zip_zstd_compress(struct acomp_req *req)
+{
+	struct crypto_acomp_stream *s;
+	struct hisi_zip_zstd_ctx *ctx;
+	size_t out_len;
+	void *src_buf, *dst_buf;
+	int ret = 0;
+
+	if (req->src_nents != 1 || req->dst_nents != 1)
+		return -EINVAL;
+
+	s = crypto_acomp_lock_stream_bh(&zstd_streams);
+	ctx = s->ctx;
+
+	/* Initialize cctx with external sequence producer */
+	ctx->cctx = zstd_init_cctx(ctx->wksp, ctx->wksp_size);
+	if (!ctx->cctx) {
+		ret = -EINVAL;
+		goto out;
+	}
+
+	/* Register our sequence producer */
+	zstd_register_sequence_producer(ctx->cctx, NULL, hisi_zip_zstd_seq_producer);
+
+	/* Get scatterlist data pointers */
+	src_buf = sg_virt(req->src);
+	dst_buf = sg_virt(req->dst);
+
+	out_len = zstd_compress_cctx(ctx->cctx, dst_buf, req->dlen,
+				     src_buf, req->slen, &ctx->params);
+	if (zstd_is_error(out_len)) {
+		ret = -EINVAL;
+		goto out;
+	}
+
+	req->dlen = out_len;
+
+out:
+	crypto_acomp_unlock_stream_bh(s);
+	return ret;
+}
+
+static int hisi_zip_zstd_decompress(struct acomp_req *req)
+{
+	struct crypto_acomp_stream *s;
+	struct hisi_zip_zstd_ctx *ctx;
+	size_t out_len;
+	void *src_buf, *dst_buf;
+	int ret = 0;
+
+	if (req->src_nents != 1 || req->dst_nents != 1)
+		return -EINVAL;
+
+	s = crypto_acomp_lock_stream_bh(&zstd_streams);
+	ctx = s->ctx;
+
+	ctx->dctx = zstd_init_dctx(ctx->wksp, ctx->wksp_size);
+	if (!ctx->dctx) {
+		ret = -EINVAL;
+		goto out;
+	}
+
+	src_buf = sg_virt(req->src);
+	dst_buf = sg_virt(req->dst);
+
+	out_len = zstd_decompress_dctx(ctx->dctx, dst_buf, req->dlen,
+				       src_buf, req->slen);
+	if (zstd_is_error(out_len)) {
+		ret = -EINVAL;
+		goto out;
+	}
+
+	req->dlen = out_len;
+
+out:
+	crypto_acomp_unlock_stream_bh(s);
+	return ret;
+}
+
+static struct acomp_alg hisi_zip_acomp_zstd = {
+	.init			= hisi_zip_zstd_init,
+	.compress		= hisi_zip_zstd_compress,
+	.decompress		= hisi_zip_zstd_decompress,
+	.base			= {
+		.cra_name		= "zstd",
+		.cra_driver_name	= "hisi-zstd-acomp",
+		.cra_flags		= CRYPTO_ALG_ASYNC |
+					  CRYPTO_ALG_NEED_FALLBACK,
+		.cra_module		= THIS_MODULE,
+		.cra_priority		= HZIP_ALG_PRIORITY,
+		.cra_ctxsize		= sizeof(struct hisi_zip_ctx),
+	}
+};
+
+static int hisi_zip_register_zstd(struct hisi_qm *qm)
+{
+	int ret;
+
+	if (!hisi_zip_alg_support(qm, HZIP_ALG_ZSTD))
+		return 0;
+
+	ret = crypto_register_acomp(&hisi_zip_acomp_zstd);
+	if (ret)
+		dev_err(&qm->pdev->dev, "failed to register to zstd (%d)!\n", ret);
+
+	return ret;
+}
+
+static void hisi_zip_unregister_zstd(struct hisi_qm *qm)
+{
+	if (!hisi_zip_alg_support(qm, HZIP_ALG_ZSTD))
+		return;
+
+	crypto_unregister_acomp(&hisi_zip_acomp_zstd);
+	crypto_acomp_free_streams(&zstd_streams);
 }
