@@ -154,6 +154,24 @@ static struct scomp_scratch *_scomp_lock_scratch(void) __acquires_ret
 	cpumask_set_cpu(cpu, &scomp_scratch_want);
 	schedule_work(&scomp_scratch_work);
 
+	/*
+	 * Try other online CPUs (excluding our own) to find one with an
+	 * already-initialized scratch before falling back to CPU 0.
+	 * This distributes the fallback load across CPUs and avoids
+	 * funneling all uninitialized-CPU requests onto CPU 0's scratch.
+	 */
+	for_each_online_cpu_wrap(cpu) {
+		scratch = per_cpu_ptr(&scomp_scratch, cpu);
+		if (cpu == raw_smp_processor_id())
+			continue;
+		if (spin_trylock(&scratch->lock)) {
+			if (scratch->src)
+				return scratch;
+			spin_unlock(&scratch->lock);
+		}
+	}
+
+	/* All else fails, fall back to CPU 0 as the safe default. */
 	scratch = per_cpu_ptr(&scomp_scratch, cpumask_first(cpu_possible_mask));
 	spin_lock(&scratch->lock);
 	return scratch;

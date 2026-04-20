@@ -459,6 +459,24 @@ struct crypto_acomp_stream *_crypto_acomp_lock_stream_bh(
 	cpumask_set_cpu(cpu, &s->stream_want);
 	schedule_work(&s->stream_work);
 
+	/*
+	 * Try other online CPUs (excluding our own) to find one with an
+	 * already-initialized context before falling back to CPU 0.
+	 * This distributes the fallback load across CPUs and avoids
+	 * funneling all uninitialized-CPU requests onto CPU 0's stream.
+	 */
+	for_each_online_cpu_wrap(cpu) {
+		ps = per_cpu_ptr(streams, cpu);
+		if (cpu == raw_smp_processor_id())
+			continue;
+		if (spin_trylock(&ps->lock)) {
+			if (ps->ctx)
+				return ps;
+			spin_unlock(&ps->lock);
+		}
+	}
+
+	/* All else fails, fall back to CPU 0 as the safe default. */
 	ps = per_cpu_ptr(streams, cpumask_first(cpu_possible_mask));
 	spin_lock(&ps->lock);
 	return ps;
